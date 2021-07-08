@@ -1,0 +1,142 @@
+﻿name: Test, Build, and Release
+on:
+  push:
+    branches:
+    - master
+    paths:
+    - 'Assets/**'
+    - 'Packages/**'
+    - 'ProjectSettings/**'
+
+jobs:
+  build:
+    name: Build for ${{ matrix.targetPlatform }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        targetPlatform:
+        - Android
+        - iOS
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
+        lfs: true
+    - uses: actions/cache@v2
+      with:
+        path: Library
+        key: Library-${{ matrix.targetPlatform }}
+        restore-keys: Library-
+    - name: Build Unity Project
+      uses: game-ci/unity-builder@main
+      env:
+        UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+        UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+      with:
+        targetPlatform: ${{ matrix.targetPlatform }}
+        buildMethod: Editor.Builder.StartBuild
+        androidAppBundle: true
+        androidKeystoreName: unity-ci-test.keystore
+        androidKeystoreBase64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        androidKeystorePass: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+        androidKeyaliasName: unity-ci-test
+        androidKeyaliasPass: ${{ secrets.ANDROID_KEYALIAS_PASS }}
+    - name: Upload Build
+      uses: actions/upload-artifact@v2
+      if: github.event.action == 'published' || contains(github.event.inputs.mode, 'release')
+      with:
+        name: unity-ci-test-${{ matrix.targetPlatform }}
+        path: build/${{ matrix.targetPlatform }}
+
+  releaseToGooglePlay:
+    name: Release to the Google Play Store
+    runs-on: ubuntu-latest
+    needs: buildWithLinux
+    if: github.event.action == 'published' || (contains(github.event.inputs.mode, 'release') && contains(github.event.inputs.mode, 'android'))
+    env:
+      GOOGLE_PLAY_KEY_FILE: ${{ secrets.GOOGLE_PLAY_KEY_FILE }}
+      GOOGLE_PLAY_KEY_FILE_PATH: ${{ format('{0}/fastlane/api-finoldigital.json', github.workspace) }}
+      ANDROID_BUILD_FILE_PATH: ${{ format('{0}/build/Android/Android.aab', github.workspace) }}
+      ANDROID_PACKAGE_NAME: com.jsaveljevs.unity-ci-test
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v2
+    - name: Download Android Artifact
+      uses: actions/download-artifact@v2
+      with:
+        name: unity-ci-test-Android
+        path: build/Android
+    - name: Write to Changelog
+      if: github.event.action == 'published'
+      env:
+        RELEASE_NOTES: ${{ github.event.release.body }}
+      run: echo "$RELEASE_NOTES" > fastlane/metadata/android/en-US/changelogs/default.txt
+    - name: Add Authentication
+      run: echo "$GOOGLE_PLAY_KEY_FILE" > $GOOGLE_PLAY_KEY_FILE_PATH
+    - name: Install Fastlane
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: 2.7.2
+        bundler-cache: true
+    - name: Upload to Google Play
+      uses: maierj/fastlane-action@v2.0.1
+      with:
+        lane: 'android playprod'
+
+  releaseToAppStore:
+    name: Release to the App Store
+    runs-on: macos-latest
+    needs: buildWithLinux
+    if: github.event.action == 'published' || (contains(github.event.inputs.mode, 'release') && contains(github.event.inputs.mode, 'ios'))
+    env:
+      APPLE_CONNECT_EMAIL: ${{ secrets.APPLE_CONNECT_EMAIL }}
+      APPLE_DEVELOPER_EMAIL: ${{ secrets.APPLE_DEVELOPER_EMAIL }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_TEAM_NAME: ${{ secrets.APPLE_TEAM_NAME }}
+      MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+      MATCH_PERSONAL_ACCESS_TOKEN: ${{ secrets.MATCH_PERSONAL_ACCESS_TOKEN }}
+      MATCH_URL: ${{ secrets.MATCH_URL }}
+      APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+      APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+      APPSTORE_P8: ${{ secrets. APPSTORE_P8 }}
+      APPSTORE_P8_PATH: ${{ format('{0}/fastlane/p8.json', github.workspace) }}
+      IOS_APP_ID: com.finoldigital.CardGameSim
+      IOS_BUILD_PATH: ${{ format('{0}/build/iOS', github.workspace) }}
+      PROJECT_NAME: Card Game Simulator
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v2
+    - name: Download iOS Artifact
+      uses: actions/download-artifact@v2
+      with:
+        name: unity-ci-test-iOS
+        path: build/iOS
+    - name: Write to Changelog
+      if: github.event.action == 'published'
+      env:
+        RELEASE_NOTES: ${{ github.event.release.body }}
+      run: echo "$RELEASE_NOTES" > fastlane/metadata/android/en-US/changelogs/default.txt
+    - name: Fix File Permissions, Code-Sign, and Get Release Notes
+      id: terminal
+      run: |
+        find $IOS_BUILD_PATH -type f -name "**.sh" -exec chmod +x {} \;
+        find $IOS_BUILD_PATH -type f -iname "usymtool" -exec chmod +x {} \;
+        echo "$APPSTORE_P8" > $APPSTORE_P8_PATH
+        export notes="$(cat fastlane/metadata/android/en-US/changelogs/default.txt)"
+        notes="${notes//'%'/'%25'}"
+        notes="${notes//$'\n'/'%0A'}"
+        notes="${notes//$'\r'/'%0D'}"
+        echo "$notes"
+        echo "::set-output name=RELEASE_NOTES::$notes"
+    - name: Install Fastlane
+      run: bundle install
+    - name: Upload to the App Store
+      uses: maierj/fastlane-action@v2.0.1
+      env:
+        RELEASE_NOTES: ${{ steps.terminal.outputs.RELEASE_NOTES }}
+        USYM_UPLOAD_AUTH_TOKEN: ${{ secrets.USYM_UPLOAD_AUTH_TOKEN }}
+      with:
+        lane: 'ios release'
